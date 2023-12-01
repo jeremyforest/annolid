@@ -22,6 +22,13 @@ RUN \
     sudo \
     ninja-build\
     ffmpeg \
+    libasound-dev \
+    libportaudio2 \
+    libportaudiocpp0 \ 
+    portaudio19-dev \
+    libegl1 \ 
+    libgl1 \ 
+    libxkbcommon0 \    
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m pip install -U pip setuptools wheel
@@ -47,7 +54,7 @@ RUN pip install --user 'git+https://github.com/facebookresearch/fvcore'
 # install detectron2
 RUN git clone https://github.com/facebookresearch/detectron2 detectron2_repo
 # set FORCE_CUDA because during `docker build` cuda is not accessible
-ENV FORCE_CUDA="1"
+# ENV FORCE_CUDA="1"
 # This will by default build detectron2 for all common cuda architectures and take a lot more time,
 # because inside `docker build`, there is no way to tell which architecture will be used.
 ARG TORCH_CUDA_ARCH_LIST="Kepler;Kepler+Tesla;Maxwell;Maxwell+Tegra;Pascal;Volta;Turing"
@@ -56,7 +63,10 @@ ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
 RUN pip install --user -e detectron2_repo
 
 RUN git clone --recurse-submodules https://github.com/healthonrails/annolid.git
-# RUN git clone --recurse-submodules -b docker_bug --single-branch https://github.com/jeremyforest/annolid.git
+
+# RUN pip install pyaudio
+RUN pip install decord sounddevice librosa
+
 RUN pip install --user -e annolid
 
 # Set a fixed model cache directory.
