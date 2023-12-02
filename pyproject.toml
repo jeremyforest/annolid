@@ -1,0 +1,45 @@
+[tool.poetry]
+name = "annolid"
+version = "0.1.0"
+description = ""
+authors = ["jeremyf <jerem.forest@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.9"
+matplotlib = "^3.2.2"
+labelme = "^4.5.6"
+PyYAML = "^6.0.1"
+decord = "^0.6.0"
+pycocotools = "^2.0.7"
+dataclasses = [{version = "^0.6", python = "<3.7"}]
+pandas = "^2.1.3"
+imageio = "^2.33.0"
+imageio-ffmpeg = "^0.4.9"
+gdown = "^4.7.1"
+segment-anything-py = "^1.0"
+scipy = "^1.11.4"
+easydict = "^1.11"
+sounddevice = "^0.4.6"
+librosa = "^0.10.1"
+qimage2ndarray = "^1.10.0"
+opencv-python-headless = "^4.8.1.78"
+qtpy = "^2.4.1"
+simplification = "^0.7.10"
+pyqt5 = "5.15.2"
+tensorboard = "^2.15.1"
+pyqtwebengine = "^5.15.0"
+pillow = "^8.3.1"
+torch = {version = "^2.1.1+cpu", source = "pytorch"}
+torchvision = {version = "^0.16.1+cpu", source = "pytorch"}
+pyqt5-sip = "^12.13.0"
+
+[tool.poetry.dev-dependencies]
+
+[[tool.poetry.source]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
