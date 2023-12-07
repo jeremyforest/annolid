@@ -32,6 +32,7 @@ pillow = "^8.3.1"
 torch = {version = "^2.1.1+cpu", source = "pytorch"}
 torchvision = {version = "^0.16.1+cpu", source = "pytorch"}
 pyqt5-sip = "^12.13.0"
+fvcore = "^0.1.5.post20221221"
 
 [tool.poetry.dev-dependencies]
 
