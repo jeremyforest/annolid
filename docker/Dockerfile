@@ -1,12 +1,9 @@
-# Modified from:
-# 1. https://github.com/facebookresearch/detectron2/blob/main/docker/Dockerfile
-# 2. https://github.com/wkentaro/labelme/blob/main/docker/Dockerfile
+FROM python:3.9.16
+LABEL maintainer "Chen Yang <healthonrails@gmail.com>, Jeremy Forest <jerem.forest@gmail.com>"
 
-FROM nvidia/cuda:11.1.1-cudnn8-devel-ubuntu20.04
-LABEL maintainer "Chen Yang <healthonrails@gmail.com>"
+ARG POETRY_VERSION=1.7.1
 
-ENV DEBIAN_FRONTEND=noninteractive
-
+#TODO Figure out which ones of those a required and which ones are not
 RUN \
   apt-get update -qq && \
   apt-get install -qq -y \
@@ -19,6 +16,7 @@ RUN \
     python3-pyqt5 \
     python3-opencv \
     python3-dev \
+    python3-setuptools \
     sudo \
     ninja-build\
     ffmpeg \
@@ -28,51 +26,27 @@ RUN \
     portaudio19-dev \
     libegl1 \ 
     libgl1 \ 
-    libxkbcommon0 \    
+    libxkbcommon0 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install -U pip setuptools wheel
-RUN ln -sv /usr/bin/python3 /usr/bin/python
-
-# create a non-root user
-ARG USER_ID=1000
-RUN useradd -m --no-log-init --system  --uid ${USER_ID} annoliduser -g sudo
-RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
-USER annoliduser
-WORKDIR /home/annoliduser
-
-ENV PATH="/home/annoliduser/.local/bin:${PATH}"
-RUN wget https://bootstrap.pypa.io/pip/3.6/get-pip.py && \
-	python3 get-pip.py --user && \
-	rm get-pip.py
-
-# install dependencies
-RUN pip install --user tensorboard cmake
-RUN pip install --user torch==1.9 torchvision==0.10 -f https://download.pytorch.org/whl/cu111/torch_stable.html
-
-RUN pip install --user 'git+https://github.com/facebookresearch/fvcore'
-# install detectron2
-RUN git clone https://github.com/facebookresearch/detectron2 detectron2_repo
-# set FORCE_CUDA because during `docker build` cuda is not accessible
-# ENV FORCE_CUDA="1"
-# This will by default build detectron2 for all common cuda architectures and take a lot more time,
-# because inside `docker build`, there is no way to tell which architecture will be used.
-ARG TORCH_CUDA_ARCH_LIST="Kepler;Kepler+Tesla;Maxwell;Maxwell+Tegra;Pascal;Volta;Turing"
-ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}"
-
-RUN pip install --user -e detectron2_repo
+# ENV QT_DEBUG_PLUGINS=1
 
 RUN git clone --recurse-submodules https://github.com/healthonrails/annolid.git
+WORKDIR annolid/
 
-# RUN pip install pyaudio
-RUN pip install decord sounddevice librosa
+# Poetry install
+# TODO Fix the dir copy for that. Right now copied manually in the docker folder which is bad
+COPY poetry.lock pyproject.toml .
+RUN pip install poetry==${POETRY_VERSION}
 
-RUN pip install --user -e annolid
+# Project initialization:
+RUN poetry config virtualenvs.create false
+RUN poetry install
 
-# Set a fixed model cache directory.
-ENV FVCORE_CACHE="/tmp"
-WORKDIR /home/annoliduser/annolid
+# install detectron2
+# Workaround for issue where detectron2 cannot be installed with poetry:
+# - https://github.com/python-poetry/poetry/issues/2113
+# - https://github.com/facebookresearch/detectron2/issues/2644
+RUN python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
 
-ENV LANG en-US
-
-ENTRYPOINT [ "annolid" ]
+CMD ["poetry", "run", "python", "annolid/gui/app.py"]
