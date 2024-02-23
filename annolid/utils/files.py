@@ -6,7 +6,53 @@ import subprocess
 import platform
 import shutil
 import glob
-import imageio
+
+
+def find_most_recent_file(folder_path, file_ext=".json"):
+    # List all files in the folder
+    if not os.path.exists(folder_path):
+        return
+    all_files = os.listdir(folder_path)
+
+    # Filter out directories and get file paths
+    file_paths = [os.path.join(folder_path, file) for file in all_files if os.path.isfile(
+        os.path.join(folder_path, file)) and file.endswith(file_ext)]
+
+    if not file_paths:
+        return None  # No files found
+
+    # Get the most recent file based on modification time
+    most_recent_file = max(file_paths, key=os.path.getmtime)
+
+    return most_recent_file
+
+# Function to clone a Git repository
+
+
+def clone_git_repository(repo_url, destination_path):
+    try:
+        # Create the destination directory if it doesn't exist
+        os.makedirs(destination_path, exist_ok=True)
+
+        # Execute the Git clone command
+        subprocess.run(["git", "clone", repo_url, destination_path])
+
+        print("Repository cloned successfully.")
+    except Exception as e:
+        print(f"Failed to clone repository: {e}")
+
+# Function to download a file
+
+
+def download_file(url, destination_path):
+    import requests
+    response = requests.get(url)
+    if response.status_code == 200:
+        with open(destination_path, 'wb') as file:
+            file.write(response.content)
+            print("Download complete.")
+    else:
+        print("Failed to download file.")
 
 
 # Function to clone a Git repository
@@ -173,6 +219,7 @@ def create_gif(img_folder: str, gif_name: str,
     --------
     None
     """
+    import imageio
     # Get the paths of the images
     saved_img_paths = gb.glob(img_folder + "/*." + suffix)
 
@@ -186,7 +233,7 @@ def create_gif(img_folder: str, gif_name: str,
     # Load the images and resize them to the specified size
     frames = []
     for img_path in sorted(saved_img_paths)[start_frame:end_frame]:
-        img = imageio.imread(img_path)
+        img = cv2.imread(img_path)
         img = cv2.resize(img, size)
         frames.append(img)
 

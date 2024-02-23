@@ -6,6 +6,7 @@ from qtpy import QtCore
 from qtpy import QtGui
 from labelme.logger import logger
 import labelme.utils
+import skimage.measure
 
 # TODO(unknown):
 # - [opt] Store paths instead of creating new ones at each paint.
@@ -31,7 +32,7 @@ class Shape(object):
     # Flag for the handles we would move if dragging
     MOVE_VERTEX = 0
 
-    # Flag for all other handles on the curent shape
+    # Flag for all other handles on the current shape
     NEAR_VERTEX = 1
 
     # The following class variables influence the drawing of all shape objects.
@@ -53,6 +54,7 @@ class Shape(object):
         flags=None,
         group_id=None,
         description=None,
+        mask=None,
     ):
         self.label = label
         self.group_id = group_id
@@ -67,6 +69,7 @@ class Shape(object):
         self.flags = flags
         self.description = description
         self.other_data = {}
+        self.mask = mask
 
         self._highlightIndex = None
         self._highlightMode = self.NEAR_VERTEX
@@ -83,18 +86,17 @@ class Shape(object):
             # is used for drawing the pending line a different color.
             self.line_color = line_color
 
+    def setShapeRefined(self, shape_type, points, point_labels, mask=None):
+        self._shape_raw = (self.shape_type, self.points, self.point_labels)
         self.shape_type = shape_type
-
-    def setShapeRefined(self, points, point_labels, shape_type):
-        self._shape_raw = (self.points, self.point_labels, self.shape_type)
         self.points = points
         self.point_labels = point_labels
-        self.shape_type = shape_type
+        self.mask = mask
 
     def restoreShapeRaw(self):
         if self._shape_raw is None:
             return
-        self.points, self.point_labels, self.shape_type = self._shape_raw
+        self.shape_type, self.points, self.point_labels = self._shape_raw
         self._shape_raw = None
 
     @property
@@ -116,6 +118,7 @@ class Shape(object):
             "linestrip",
             "multipoints",
             "points",
+            "mask",
         ]:
             raise ValueError("Unexpected shape_type: {}".format(value))
         self._shape_type = value
@@ -188,26 +191,56 @@ class Shape(object):
         return QtCore.QRectF(x1, y1, x2 - x1, y2 - y1)
 
     def paint(self, painter):
-        if self.points:
-            color = (
-                self.select_line_color if self.selected else self.line_color
-            )
-            pen = QtGui.QPen(color)
-            # Try using integer sizes for smoother drawing(?)
-            pen.setWidth(max(1, int(round(2.0 / self.scale))))
-            painter.setPen(pen)
+        if self.mask is None and not self.points:
+            return
 
+        color = self.select_line_color if self.selected else self.line_color
+        pen = QtGui.QPen(color)
+        # Try using integer sizes for smoother drawing(?)
+        pen.setWidth(max(1, int(round(2.0 / self.scale))))
+        painter.setPen(pen)
+
+        if self.mask is not None:
+            image_to_draw = np.zeros(self.mask.shape + (4,), dtype=np.uint8)
+            fill_color = (
+                self.select_fill_color.getRgb()
+                if self.selected
+                else self.fill_color.getRgb()
+            )
+            image_to_draw[self.mask] = fill_color
+            qimage = QtGui.QImage.fromData(
+                labelme.utils.img_arr_to_data(image_to_draw)
+            )
+            painter.drawImage(
+                int(round(self.points[0].x())),
+                int(round(self.points[0].y())),
+                qimage,
+            )
+
+            line_path = QtGui.QPainterPath()
+            contours = skimage.measure.find_contours(
+                np.pad(self.mask, pad_width=1)
+            )
+            for contour in contours:
+                contour += [self.points[0].y(), self.points[0].x()]
+                line_path.moveTo(contour[0, 1], contour[0, 0])
+                for point in contour[1:]:
+                    line_path.lineTo(point[1], point[0])
+            painter.drawPath(line_path)
+
+        if self.points:
             line_path = QtGui.QPainterPath()
             vrtx_path = QtGui.QPainterPath()
             negative_vrtx_path = QtGui.QPainterPath()
 
-            if self.shape_type == "rectangle":
+            if self.shape_type in ["rectangle", "mask"]:
                 assert len(self.points) in [1, 2]
                 if len(self.points) == 2:
                     rectangle = self.getRectFromLine(*self.points)
                     line_path.addRect(rectangle)
-                for i in range(len(self.points)):
-                    self.drawVertex(vrtx_path, i)
+                if self.shape_type == "rectangle":
+                    for i in range(len(self.points)):
+                        self.drawVertex(vrtx_path, i)
             elif self.shape_type == "circle":
                 assert len(self.points) in [1, 2]
                 if len(self.points) == 2:
@@ -220,9 +253,8 @@ class Shape(object):
                 for i, p in enumerate(self.points):
                     line_path.lineTo(p)
                     self.drawVertex(vrtx_path, i)
-
             elif self.shape_type == "points":
-                #assert len(self.points) == len(self.point_labels)
+                assert len(self.points) == len(self.point_labels)
                 for i, (p, l) in enumerate(
                     zip(self.points, self.point_labels)
                 ):
@@ -242,39 +274,23 @@ class Shape(object):
                     self.drawVertex(vrtx_path, i)
                 if self.isClosed():
                     line_path.lineTo(self.points[0])
-                    if self.shape_type == "line":
-
-                        label_x, label_y = self.points[0].x(
-                        ), self.points[0].y()
-                        if len(self.points) > 1:
-                            dist = labelme.utils.distance(
-                                self.points[0] - self.points[1])
-                            painter.setFont(QtGui.QFont(
-                                "Arial", 3 * int(self.point_size/self.scale)))
-                            painter.drawText(
-                                int(label_x - self.point_size),
-                                int(label_y - self.point_size),
-                                f"length:{round(dist,2)}pixels")
-
-            if self.label:
-                font = QtGui.QFont(
-                    "Arial", int(3 * self.point_size/self.scale))
-                painter.setFont(font)
-                label_x, label_y = self.find_polygon_center(
-                    self.points)
-                painter.drawText(
-                    int(label_x)+1, int(label_y), str(self.label))
 
             painter.drawPath(line_path)
-            painter.drawPath(vrtx_path)
-            painter.fillPath(vrtx_path, self._vertex_fill_color)
-            if self.fill:
+            if vrtx_path.length() > 0:
+                painter.drawPath(vrtx_path)
+                painter.fillPath(vrtx_path, self._vertex_fill_color)
+            if self.fill and self.mask is None:
                 color = (
                     self.select_fill_color
                     if self.selected
                     else self.fill_color
                 )
                 painter.fillPath(line_path, color)
+
+            pen.setColor(QtGui.QColor(255, 0, 0, 255))
+            painter.setPen(pen)
+            painter.drawPath(negative_vrtx_path)
+            painter.fillPath(negative_vrtx_path, QtGui.QColor(255, 0, 0, 255))
 
     def drawVertex(self, path, i):
         d = self.point_size / self.scale
@@ -316,6 +332,19 @@ class Shape(object):
         return post_i
 
     def containsPoint(self, point):
+        if self.mask is not None:
+            y = np.clip(
+                int(round(point.y() - self.points[0].y())),
+                0,
+                self.mask.shape[0] - 1,
+            )
+            x = np.clip(
+                int(round(point.x() - self.points[0].x())),
+                0,
+                self.mask.shape[1] - 1,
+            )
+            return self.mask[y, x]
+
         if not self.makePath():
             return False
         return self.makePath().contains(point)
@@ -331,7 +360,7 @@ class Shape(object):
         return rectangle
 
     def makePath(self):
-        if self.shape_type == "rectangle":
+        if self.shape_type in ["rectangle", "mask"]:
             path = QtGui.QPainterPath()
             if len(self.points) == 2:
                 rectangle = self.getRectFromLine(*self.points)
@@ -342,13 +371,10 @@ class Shape(object):
                 rectangle = self.getCircleRectFromLine(self.points)
                 path.addEllipse(rectangle)
         else:
-            if self.points:
-                path = QtGui.QPainterPath(self.points[0])
-                for p in self.points[1:]:
-                    path.lineTo(p)
-                return path
-            else:
-                return QtGui.QPainterPath()
+            path = QtGui.QPainterPath(self.points[0])
+            for p in self.points[1:]:
+                path.lineTo(p)
+            return path
 
     def boundingRect(self):
         return self.makePath().boundingRect()
@@ -450,7 +476,7 @@ class MultipoinstShape(Shape):
         pass
 
 
-class MaskShape(object):
+class MaskShape(MultipoinstShape):
     """
     Modified from
     https://github.com/originlake/labelme-with-segment-anything/blob/main/labelme/shape.py
@@ -475,6 +501,7 @@ class MaskShape(object):
         self.mask = None
         self.logits = None
         self.scale = 1
+        self.points = []
 
     def setScaleMask(self, scale, mask):
         self.scale = scale
@@ -528,6 +555,7 @@ class MaskShape(object):
                       description=self.description)
         for x, y in merged_contour:
             shape.addPoint(QtCore.QPointF(x, y))
+        self.points = shape.points
         shapes.append(shape)
         return shapes
 

@@ -5,9 +5,8 @@ import threading
 import imgviz
 import numpy as np
 import onnxruntime
-import PIL.Image
 import skimage.measure
-
+import cv2
 from labelme.logger import logger
 
 
@@ -72,6 +71,18 @@ class SegmentAnythingModel:
         )
         return polygon
 
+    def predict_mask_from_points(self, points, point_labels):
+        image_embedding = self._get_image_embedding()
+        mask = _compute_mask_from_points(
+            image_size=self._image_size,
+            decoder_session=self._decoder_session,
+            image=self._image,
+            image_embedding=image_embedding,
+            points=points,
+            point_labels=point_labels,
+        )
+        return mask
+
 
 def _compute_scale_to_resize_image(image_size, image):
     height, width = image.shape[:2]
@@ -99,6 +110,17 @@ def _resize_image(image_size, image):
     return scale, scaled_image
 
 
+def postprocess_masks(mask, img_size, input_size, original_size):
+    mask = mask.squeeze(0).transpose(1, 2, 0)
+    mask = cv2.resize(mask, (img_size, img_size),
+                      interpolation=cv2.INTER_LINEAR)
+    mask = mask[:input_size[0], :input_size[1], :]
+    mask = cv2.resize(
+        mask, (original_size[1], original_size[0]), interpolation=cv2.INTER_LINEAR)
+    mask = mask.transpose(2, 0, 1)[None, :, :, :]
+    return mask
+
+
 def _compute_image_embedding(image_size, encoder_session, image):
     image = imgviz.asrgb(image)
 
@@ -115,8 +137,12 @@ def _compute_image_embedding(image_size, encoder_session, image):
         ),
     )
     x = x.transpose(2, 0, 1)[None, :, :, :]
-
-    output = encoder_session.run(output_names=None, input_feed={"x": x})
+    input_names = [input.name for input in encoder_session.get_inputs()]
+    if input_names[0] == 'image':
+        output = encoder_session.run(
+            output_names=None, input_feed={"image": x})
+    else:
+        output = encoder_session.run(output_names=None, input_feed={"x": x})
     image_embedding = output[0]
 
     return image_embedding
@@ -128,9 +154,9 @@ def _get_contour_length(contour):
     return np.linalg.norm(contour_end - contour_start, axis=1).sum()
 
 
-def _compute_polygon_from_points(
-    image_size, decoder_session, image, image_embedding, points, point_labels
-):
+def _compute_mask_from_points(
+        image_size, decoder_session, image, image_embedding,
+        points, point_labels):
     input_point = np.array(points, dtype=np.float32)
     input_label = np.array(point_labels, dtype=np.int32)
 
@@ -152,38 +178,60 @@ def _compute_polygon_from_points(
     onnx_mask_input = np.zeros((1, 1, 256, 256), dtype=np.float32)
     onnx_has_mask_input = np.array([-1], dtype=np.float32)
 
-    decoder_inputs = {
-        "image_embeddings": image_embedding,
-        "point_coords": onnx_coord,
-        "point_labels": onnx_label,
-        "mask_input": onnx_mask_input,
-        "has_mask_input": onnx_has_mask_input,
-        "orig_im_size": np.array(image.shape[:2], dtype=np.float32),
-    }
+    input_names = [input.name for input in decoder_session.get_inputs()]
+    if len(input_names) <= 3:
+        outputs = decoder_session.run(None, {
+            'image_embeddings': image_embedding,
+            'point_coords': onnx_coord,
+            'point_labels': onnx_label,
+        })
+        scores, masks = outputs
+        masks = postprocess_masks(
+            masks, image_size, (new_height, new_width), np.array(image.shape[:2]))
 
-    masks, _, _ = decoder_session.run(None, decoder_inputs)
+    else:
+        decoder_inputs = {
+            "image_embeddings": image_embedding,
+            "point_coords": onnx_coord,
+            "point_labels": onnx_label,
+            "mask_input": onnx_mask_input,
+            "has_mask_input": onnx_has_mask_input,
+            "orig_im_size": np.array(image.shape[:2], dtype=np.float32),
+        }
+
+        masks, _, _ = decoder_session.run(None, decoder_inputs)
     mask = masks[0, 0]  # (1, 1, H, W) -> (H, W)
     mask = mask > 0.0
+
+    MIN_SIZE_RATIO = 0.05
+    skimage.morphology.remove_small_objects(
+        mask, min_size=mask.sum() * MIN_SIZE_RATIO, out=mask
+    )
+
     if 0:
         imgviz.io.imsave(
             "mask.jpg", imgviz.label2rgb(mask, imgviz.rgb2gray(image))
         )
+    return mask
 
-    contours = skimage.measure.find_contours(np.pad(mask, pad_width=1))
-    contour = max(contours, key=_get_contour_length)
-    polygon = skimage.measure.approximate_polygon(
-        coords=contour,
-        tolerance=np.ptp(contour, axis=0).max() / 100,
+
+def _compute_polygon_from_points(
+    image_size, decoder_session, image, image_embedding, points, point_labels
+):
+    from annolid.annotation.masks import mask_to_polygons
+    mask = _compute_mask_from_points(
+        image_size=image_size,
+        decoder_session=decoder_session,
+        image=image,
+        image_embedding=image_embedding,
+        points=points,
+        point_labels=point_labels,
     )
-    polygon = np.clip(polygon, (0, 0), (mask.shape[0] - 1, mask.shape[1] - 1))
-    polygon = polygon[:-1]  # drop last point that is duplicate of first point
-    if 0:
-        image_pil = PIL.Image.fromarray(image)
-        imgviz.draw.line_(image_pil, yx=polygon, fill=(0, 255, 0))
-        for point in polygon:
-            imgviz.draw.circle_(
-                image_pil, center=point, diameter=10, fill=(0, 255, 0)
-            )
-        imgviz.io.imsave("contour.jpg", np.asarray(image_pil))
-
-    return polygon[:, ::-1]  # yx -> xy
+    polygons, has_holes = mask_to_polygons(mask)
+    if len(polygons) == 0:
+        logger.warning("No polygon found, returning empty polygon.")
+        return np.empty((0, 2), dtype=np.float32)
+    polys = polygons[0]
+    all_points = np.array(
+        list(zip(polys[0::2], polys[1::2])))
+    return all_points

@@ -29,12 +29,14 @@ from labelme.app import MainWindow
 from labelme.utils import newAction
 from labelme.widgets import BrightnessContrastDialog
 from labelme.widgets import LabelListWidgetItem
-from labelme.label_file import LabelFileError
-from labelme.label_file import LabelFile
 from labelme import utils
+from labelme.logger import logger
 from labelme.widgets import ToolBar
+from annolid.gui.label_file import LabelFileError
+from annolid.gui.label_file import LabelFile
 from annolid.configs import get_config
 from annolid.gui.widgets.canvas import Canvas
+from annolid.gui.widgets.text_prompt import AiRectangleWidget
 from annolid.annotation import labelme2coco
 from annolid.data import videos
 from annolid.gui.widgets import ExtractFrameDialog
@@ -55,6 +57,8 @@ from annolid.gui.widgets.step_size_widget import StepSizeWidget
 from annolid.postprocessing.quality_control import pred_dict_to_labelme
 from annolid.annotation.keypoints import save_labels
 from annolid.annotation.timestamps import convert_frame_number_to_time
+from annolid.segmentation.SAM.edge_sam_bg import VideoProcessor
+from labelme.ai import MODELS
 __appname__ = 'Annolid'
 __version__ = "1.1.3"
 
@@ -64,6 +68,7 @@ LABEL_COLORMAP = imgviz.label_colormap(value=200)
 
 class FlexibleWorker(QtCore.QObject):
     start = QtCore.Signal()
+    finished = QtCore.Signal()
 
     def __init__(self, function, *args, **kwargs):
         super(FlexibleWorker, self).__init__()
@@ -74,6 +79,7 @@ class FlexibleWorker(QtCore.QObject):
 
     def run(self):
         self.function(*self.args, **self.kwargs)
+        self.finished.emit()
 
 
 class LoadFrameThread(QtCore.QObject):
@@ -205,6 +211,7 @@ class AnnolidWindow(MainWindow):
         self.highlighted_mark = None
         self.step_size = 1
         self.stepSizeWidget = StepSizeWidget()
+        self.prev_shapes = None
 
         self.canvas = self.labelList.canvas = Canvas(
             epsilon=self._config["epsilon"],
@@ -239,6 +246,32 @@ class AnnolidWindow(MainWindow):
             self.segmentAnything,
             icon="objects",
             tip=self.tr("Start creating polygons with segment anything"),
+        )
+
+        createAiPolygonMode = action(
+            self.tr("Create AI-Polygon"),
+            lambda: self.toggleDrawMode(False, createMode="ai_polygon"),
+            None,
+            "objects",
+            self.tr("Start drawing ai_polygon. Ctrl+LeftClick ends creation."),
+            enabled=False,
+        )
+
+        createAiPolygonMode.changed.connect(
+            lambda: self.canvas.initializeAiModel(
+                name=self._selectAiModelComboBox.currentText()
+            )
+            if self.canvas.createMode == "ai_polygon"
+            else None
+        )
+
+        self.createGroundingSAMMode = action(
+            self.tr("Create GroundingSAM"),
+            lambda: self.toggleDrawMode(False, createMode="grounding_sam"),
+            None,
+            "objects",
+            self.tr("Start using grounding_sam"),
+            enabled=False,
         )
 
         open_video = action(
@@ -419,11 +452,17 @@ class AnnolidWindow(MainWindow):
             colab=self.menu(self.tr("&Open in Colab")),
         )
 
+        self.aiRectangle = AiRectangleWidget()
+        self.aiRectangle._aiRectanglePrompt.returnPressed.connect(
+            self._grounding_sam
+        )
+
         _action_tools = list(self.actions.tool)
         _action_tools.insert(0, frames)
         _action_tools.insert(1, open_video)
         _action_tools.insert(2, step_size)
         _action_tools.append(self.createPolygonSAMMode)
+        _action_tools.append(self.aiRectangle.aiRectangleAction)
         _action_tools.append(coco)
         _action_tools.append(models)
         _action_tools.append(tracks)
@@ -435,6 +474,7 @@ class AnnolidWindow(MainWindow):
 
         self.actions.tool = tuple(_action_tools)
         self.tools.clear()
+
         utils.addActions(self.tools, self.actions.tool)
         utils.addActions(self.menus.frames, (frames,))
         utils.addActions(self.menus.open_video, (open_video, open_audio))
@@ -461,15 +501,46 @@ class AnnolidWindow(MainWindow):
         self.seg_train_thread = QtCore.QThread()
         self.destroyed.connect(self.clean_up)
         self.stepSizeWidget.valueChanged.connect(self.update_step_size)
+        self.stepSizeWidget.predict_button.pressed.connect(
+            self.predict_from_next_frame)
         atexit.register(self.clean_up)
         # Callbacks:
         self.zoomWidget.valueChanged.connect(self.paintCanvas)
 
+        self._selectAiModelComboBox.clear()
+        self.custom_ai_model_names = [
+            'SAM_HQ', 'Cutie_VOS', "EfficientVit_SAM"]
+        model_names = [model.name for model in MODELS] + \
+            self.custom_ai_model_names
+        self._selectAiModelComboBox.addItems(model_names)
+        # Set EdgeSAM as default
+        if self._config["ai"]["default"] in model_names:
+            model_index = model_names.index(self._config["ai"]["default"])
+        else:
+            logger.warning(
+                "Default AI model is not found: %r",
+                self._config["ai"]["default"],
+            )
+            model_index = 0
+        self._selectAiModelComboBox.setCurrentIndex(model_index)
+        self._selectAiModelComboBox.currentIndexChanged.connect(
+            lambda: self.canvas.initializeAiModel(
+                name=self._selectAiModelComboBox.currentText()
+            )
+            if self.canvas.createMode in ["ai_polygon", "ai_mask"]
+            else None
+        )
+
         self.populateModeActions()
+
+    def _grounding_sam(self):
+        self.toggleDrawMode(False, createMode="grounding_sam")
+        self.canvas.predictAiRectangle(
+            self.aiRectangle._aiRectanglePrompt.text())
 
     def update_step_size(self, value):
         self.step_size = value
-        self.stepSizeWidget.setValue(self.step_size)
+        self.stepSizeWidget.set_value(self.step_size)
 
     def flag_item_clicked(self, item):
         item_text = item.text()
@@ -541,87 +612,28 @@ class AnnolidWindow(MainWindow):
         self.playVideo(isPlaying=False)
 
     def toggleDrawMode(self, edit=True, createMode="polygon"):
+
+        draw_actions = {
+            "polygon": self.actions.createMode,
+            "rectangle": self.actions.createRectangleMode,
+            "circle": self.actions.createCircleMode,
+            "point": self.actions.createPointMode,
+            "line": self.actions.createLineMode,
+            "linestrip": self.actions.createLineStripMode,
+            "ai_polygon": self.actions.createAiPolygonMode,
+            "ai_mask": self.actions.createAiMaskMode,
+            "polygonSAM": self.createPolygonSAMMode,
+            "grouding_sam": self.createGroundingSAMMode,
+        }
+
         self.canvas.setEditing(edit)
         self.canvas.createMode = createMode
         if edit:
-            self.actions.createMode.setEnabled(True)
-            self.actions.createRectangleMode.setEnabled(True)
-            self.actions.createCircleMode.setEnabled(True)
-            self.actions.createLineMode.setEnabled(True)
-            self.actions.createPointMode.setEnabled(True)
-            self.actions.createLineStripMode.setEnabled(True)
-            self.createPolygonSAMMode.setEnabled(True)
+            for draw_action in draw_actions.values():
+                draw_action.setEnabled(True)
         else:
-            if createMode == "polygon":
-                self.actions.createMode.setEnabled(False)
-                self.actions.createRectangleMode.setEnabled(True)
-                self.actions.createCircleMode.setEnabled(True)
-                self.actions.createLineMode.setEnabled(True)
-                self.actions.createPointMode.setEnabled(True)
-                self.actions.createLineStripMode.setEnabled(True)
-                self.createPolygonSAMMode.setEnabled(True)
-            elif createMode == "rectangle":
-                self.actions.createMode.setEnabled(True)
-                self.actions.createRectangleMode.setEnabled(False)
-                self.actions.createCircleMode.setEnabled(True)
-                self.actions.createLineMode.setEnabled(True)
-                self.actions.createPointMode.setEnabled(True)
-                self.actions.createLineStripMode.setEnabled(True)
-                self.createPolygonSAMMode.setEnabled(True)
-            elif createMode == "line":
-                self.actions.createMode.setEnabled(True)
-                self.actions.createRectangleMode.setEnabled(True)
-                self.actions.createCircleMode.setEnabled(True)
-                self.actions.createLineMode.setEnabled(False)
-                self.actions.createPointMode.setEnabled(True)
-                self.actions.createLineStripMode.setEnabled(True)
-                self.createPolygonSAMMode.setEnabled(True)
-            elif createMode == "point":
-                self.actions.createMode.setEnabled(True)
-                self.actions.createRectangleMode.setEnabled(True)
-                self.actions.createCircleMode.setEnabled(True)
-                self.actions.createLineMode.setEnabled(True)
-                self.actions.createPointMode.setEnabled(False)
-                self.actions.createLineStripMode.setEnabled(True)
-                self.createPolygonSAMMode.setEnabled(True)
-            elif createMode == "circle":
-                self.actions.createMode.setEnabled(True)
-                self.actions.createRectangleMode.setEnabled(True)
-                self.actions.createCircleMode.setEnabled(False)
-                self.actions.createLineMode.setEnabled(True)
-                self.actions.createPointMode.setEnabled(True)
-                self.actions.createLineStripMode.setEnabled(True)
-                self.createPolygonSAMMode.setEnabled(True)
-            elif createMode == "linestrip":
-                self.actions.createMode.setEnabled(True)
-                self.actions.createRectangleMode.setEnabled(True)
-                self.actions.createCircleMode.setEnabled(True)
-                self.actions.createLineMode.setEnabled(True)
-                self.actions.createPointMode.setEnabled(True)
-                self.actions.createLineStripMode.setEnabled(False)
-                self.createPolygonSAMMode.setEnabled(True)
-            elif createMode == "polygonSAM":
-                self.actions.createMode.setEnabled(True)
-                self.actions.createRectangleMode.setEnabled(True)
-                self.actions.createCircleMode.setEnabled(True)
-                self.actions.createLineMode.setEnabled(True)
-                self.actions.createPointMode.setEnabled(True)
-                self.actions.createLineStripMode.setEnabled(True)
-                self.createPolygonSAMMode.setEnabled(False)
-            elif createMode == "ai_polygon":
-                self.actions.createMode.setEnabled(True)
-                self.actions.createRectangleMode.setEnabled(True)
-                self.actions.createCircleMode.setEnabled(True)
-                self.actions.createLineMode.setEnabled(True)
-                self.actions.createPointMode.setEnabled(True)
-                self.actions.createLineStripMode.setEnabled(True)
-                self.actions.createAiPolygonMode.setEnabled(False)
-                self.canvas.initializeAiModel(
-                    name=self._selectAiModelComboBox.currentText()
-                )
-                self._selectAiModelComboBox.setEnabled(True)
-            else:
-                raise ValueError("Unsupported createMode: %s" % createMode)
+            for draw_mode, draw_action in draw_actions.items():
+                draw_action.setEnabled(createMode != draw_mode)
         self.actions.editMode.setEnabled(not edit)
 
     def closeFile(self, _value=False):
@@ -880,6 +892,68 @@ class AnnolidWindow(MainWindow):
             imgviz.io.imsave(image_filename, img)
         return image_filename
 
+    def _select_sam_model_name(self):
+        model_names = {
+            "SAM_HQ": "sam_hq",
+            "EfficientVit_SAM": "efficientvit_sam",
+            "Cutie_VOS": "Cutie_VOS"
+        }
+        default_model_name = "Segment-Anything (Edge)"
+
+        current_text = self._selectAiModelComboBox.currentText()
+        model_name = model_names.get(current_text, default_model_name)
+
+        return model_name
+
+    def predict_from_next_frame(self,
+                                to_frame=60):
+        if len(self.canvas.shapes) <= 0:
+
+            QtWidgets.QMessageBox.about(self,
+                                        "No Shapes or Labeled Frames",
+                                        f"Please label this frame")
+            return
+
+        model_name = self._select_sam_model_name()
+
+        if self.video_file:
+            self.video_processor = VideoProcessor(
+                self.video_file,
+                model_name=model_name,
+                save_image_to_disk=False
+            )
+            self.seg_pred_thread.start()
+            if self.step_size < 0:
+                end_frame = self.num_frames + self.step_size
+            else:
+                end_frame = self.frame_number + to_frame * self.step_size
+            if end_frame >= self.num_frames:
+                end_frame = self.num_frames - 1
+            if self.step_size < 0:
+                self.step_size = -self.step_size
+            self.pred_worker = FlexibleWorker(
+                function=self.video_processor.process_video_frames,
+                start_frame=self.frame_number+1,
+                end_frame=end_frame,
+                step=self.step_size,
+                is_cutie=model_name == "Cutie_VOS",
+            )
+            self.frame_number += 1
+            self.stepSizeWidget.predict_button.setEnabled(False)
+            self.pred_worker.moveToThread(self.seg_pred_thread)
+            self.pred_worker.start.connect(self.pred_worker.run)
+            self.seg_pred_thread.started.connect(self.pred_worker.start)
+            self.pred_worker.finished.connect(self.predict_is_ready)
+            self.seg_pred_thread.finished.connect(
+                self.seg_pred_thread.quit)
+            self.pred_worker.start.emit()
+
+    def predict_is_ready(self):
+        QtWidgets.QMessageBox.information(
+            self, "Prediction Ready",
+            "Predictions for the video frames have been generated!")
+        self.stepSizeWidget.predict_button.setEnabled(True)
+
     def saveLabels(self, filename):
         lf = LabelFile()
 
@@ -894,6 +968,9 @@ class AnnolidWindow(MainWindow):
                     group_id=s.group_id,
                     shape_type=s.shape_type,
                     flags=s.flags,
+                    mask=None
+                    if s.mask is None
+                    else utils.img_arr_to_b64(s.mask),
                 )
             )
             return data
@@ -920,6 +997,7 @@ class AnnolidWindow(MainWindow):
                 otherData=self.otherData,
                 flags=flags,
             )
+
             self.labelFile = lf
             items = self.fileListWidget.findItems(
                 self.imagePath, Qt.MatchExactly
@@ -1030,6 +1108,52 @@ class AnnolidWindow(MainWindow):
                 else:
                     title = "{} - {}*".format(title, _filename)
         return title
+
+    def deleteAllFuturePredictions(self):
+        if self.video_loader:
+            prediction_folder = self.video_results_folder
+            for prediction_file in os.listdir(prediction_folder):
+                prediction_file_path = os.path.join(
+                    prediction_folder, prediction_file)
+                if os.path.isfile(prediction_file_path):
+                    if ".json" in prediction_file_path:
+                        is_future_frames = int(prediction_file_path.split(
+                            '_')[-1].replace('.json', '')) > self.frame_number
+                        if is_future_frames:
+                            os.remove(prediction_file_path)
+            logger.info(
+                "All predictions from the next frames are removed from now on.")
+
+    def deleteFile(self):
+        mb = QtWidgets.QMessageBox
+        msg = self.tr(
+            "You are about to permanently delete this label file, "
+            "Or all the predicted label files from the next frame, "
+            "what would you like to do?"
+        )
+        msg_box = mb(self)
+        msg_box.setIcon(mb.Warning)
+        msg_box.setText(msg)
+        msg_box.setStandardButtons(mb.No | mb.Yes | mb.YesToAll)
+        msg_box.setDefaultButton(mb.No)
+        answer = msg_box.exec_()
+
+        if answer == mb.No:
+            return
+        elif answer == mb.YesToAll:
+            # Handle the case to delete all predictions from now on
+            self.deleteAllFuturePredictions()
+        else:
+            label_file = self.getLabelFile()
+            if osp.exists(label_file):
+                os.remove(label_file)
+                logger.info("Label file is removed: {}".format(label_file))
+
+                item = self.fileListWidget.currentItem()
+                if item:
+                    item.setCheckState(Qt.Unchecked)
+
+                self.resetState()
 
     def setClean(self):
         self.dirty = False
@@ -1161,8 +1285,24 @@ class AnnolidWindow(MainWindow):
         out_video_file = str(Path(video_file).name)
         out_video_file = f"tracked_{out_video_file}"
 
-        if config_file is None:
+        if config_file is None and algo != "SAM Predictions":
             return
+        if algo == 'SAM Predictions':
+            from annolid.annotation import labelme2csv
+            out_folder = Path(video_file).with_suffix('')
+            if not out_folder.exists():
+                QtWidgets.QMessageBox.about(self,
+                                            "No predictions",
+                                            "Help SAM achieve precise predictions by labeling a few frames.\
+                                              Your input is valuable!")
+
+                return
+            labelme2csv.convert_json_to_csv(str(out_folder))
+            QtWidgets.QMessageBox.about(self,
+                                        "Tracking results are ready.",
+                                        f"Kindly review the file here: {str(out_folder) + '.csv'}.")
+            self.statusBar().showMessage(
+                self.tr(f"Done"))
 
         if algo == 'Detectron2':
             try:
@@ -1202,6 +1342,8 @@ class AnnolidWindow(MainWindow):
                                         Please do not close Annolid GUI"
                                         )
             self.importDirImages(out_result_dir)
+            self.statusBar().showMessage(
+                self.tr(f"Tracking..."))
 
         if algo == 'YOLACT':
             if not torch.cuda.is_available():
@@ -1233,8 +1375,8 @@ class AnnolidWindow(MainWindow):
                                         "Started",
                                         f"Results are in folder: \
                                             {str(out_runs_dir)}")
-        self.statusBar().showMessage(
-            self.tr(f"Tracking..."))
+            self.statusBar().showMessage(
+                self.tr(f"Tracking..."))
 
     def models(self):
         """
@@ -1460,36 +1602,47 @@ class AnnolidWindow(MainWindow):
 
     def load_tracking_results(self, cur_video_folder, video_filename):
         """Load tracking results from CSV files in the given folder that match the video filename."""
-        _tracking_csv_file = None
-        _video_name = Path(video_filename).stem
+        self.timestamp_dict = {}  # Assuming timestamp_dict is an instance variable
+
+        video_name = Path(video_filename).stem
+        tracking_csv_file = None
+
         for tr in cur_video_folder.glob('*.csv'):
-            if not tr.is_file() or not tr.suffix == '.csv':
+            if not (tr.is_file() and tr.suffix == '.csv'):
                 continue
 
-            if 'timestamp' in tr.name and _video_name in tr.name:
-                _df_timestamps = pd.read_csv(str(tr))
-                # iterate over the rows of the DataFrame
-                for _, row in _df_timestamps.iterrows():
-                    timestamp = row['Timestamp']
-                    frame_time = row['Frame_number']
-                    if isinstance(frame_time, int):
-                        frame_number = frame_time
-                        mark_type = 'event_start'
-                    else:
-                        frame_number, mark_type = eval(frame_time)
-                    # add the timestamp and frame_number to the dictionary
-                    self.timestamp_dict[(
-                        frame_number, mark_type)] = timestamp
-            if 'tracking' in tr.name and _video_name in tr.name and '_nix' not in tr.name:
-                _tracking_csv_file = tr
-            elif '_labels' in tr.name and _video_name in tr.name:
-                self._df = pd.read_csv(tr)
-                self._df.rename(
-                    columns={'Unnamed: 0': 'frame_number'}, inplace=True)
+            if 'timestamp' in tr.name and video_name in tr.name:
+                self._load_timestamps(tr)
 
-        if _tracking_csv_file is not None:
-            self._df = pd.read_csv(_tracking_csv_file)
+            if 'tracking' in tr.name and video_name in tr.name and '_nix' not in tr.name:
+                tracking_csv_file = tr
+
+            elif '_labels' in tr.name and video_name in tr.name:
+                self._load_labels(tr)
+
+        if tracking_csv_file:
+            self._df = pd.read_csv(tracking_csv_file)
             self._df = self._df.drop(columns=['Unnamed: 0'], errors='ignore')
+
+    def _load_timestamps(self, timestamp_csv_file):
+        """Load timestamps from the given CSV file and update timestamp_dict."""
+        df_timestamps = pd.read_csv(str(timestamp_csv_file))
+        for _, row in df_timestamps.iterrows():
+            timestamp = row['Timestamp']
+            frame_time = row['Frame_number']
+
+            if isinstance(frame_time, int):
+                frame_number = frame_time
+                mark_type = 'event_start'
+            else:
+                frame_number, mark_type = eval(frame_time)
+
+            self.timestamp_dict[(frame_number, mark_type)] = timestamp
+
+    def _load_labels(self, labels_csv_file):
+        """Load labels from the given CSV file."""
+        self._df = pd.read_csv(labels_csv_file)
+        self._df.rename(columns={'Unnamed: 0': 'frame_number'}, inplace=True)
 
     def openVideo(self, _value=False):
         """open a video for annotaiton frame by frame
@@ -1529,7 +1682,15 @@ class AnnolidWindow(MainWindow):
             )
             self.annotation_dir = self.video_results_folder
             self.video_file = video_filename
-            self.video_loader = videos.CV2Video(video_filename)
+            try:
+                self.video_loader = videos.CV2Video(video_filename)
+            except Exception:
+                QtWidgets.QMessageBox.about(self,
+                                            "Not a valid video file",
+                                            f"Please check and open a correct video file.")
+                self.video_file = None
+                self.video_loader = None
+                return
             self.fps = self.video_loader.get_fps()
 
             self.num_frames = self.video_loader.total_frames()
@@ -1541,7 +1702,6 @@ class AnnolidWindow(MainWindow):
             self.set_frame_number(self.frame_number)
 
             self.actions.openNextImg.setEnabled(True)
-            self.openNextImg(load=True)
 
             self.actions.openPrevImg.setEnabled(True)
 
@@ -1675,6 +1835,7 @@ class AnnolidWindow(MainWindow):
             shape_type = shape["shape_type"]
             flags = shape["flags"]
             group_id = shape["group_id"]
+            description = shape.get("description", "")
             other_data = shape["other_data"]
 
             if not points:
@@ -1685,6 +1846,8 @@ class AnnolidWindow(MainWindow):
                 label=label,
                 shape_type=shape_type,
                 group_id=group_id,
+                description=description,
+                mask=shape["mask"],
             )
             for x, y in points:
                 shape.addPoint(QtCore.QPointF(x, y))
@@ -1707,6 +1870,9 @@ class AnnolidWindow(MainWindow):
     def loadShapes(self, shapes, replace=True):
         self._noSelectionSlot = True
         for shape in shapes:
+            if not isinstance(shape.points[0], QtCore.QPointF):
+                shape.points = [QtCore.QPointF(x, y)
+                                for x, y in shape.points]
             self.addLabel(shape)
         self.labelList.clearSelection()
         self._noSelectionSlot = False
@@ -1740,25 +1906,16 @@ class AnnolidWindow(MainWindow):
                 pred_label_list = pred_dict_to_labelme(row)
                 frame_label_list += pred_label_list
 
-            save_labels(label_json_file,
-                        str(filename),
-                        frame_label_list,
-                        self.video_loader.height,
-                        self.video_loader.width,
-                        imageData=self.imageData,
-                        save_image_to_json=False
-                        )
+            self.loadShapes(frame_label_list)
 
         if Path(label_json_file).exists():
             try:
-                self.labelFile = LabelFile(label_json_file)
+                self.labelFile = LabelFile(label_json_file,
+                                           is_video_frame=True)
                 if self.labelFile:
-                    shapes = self.loadLabels(self.labelFile.shapes)
-            except Exception:
-                print(f'Count not load label json file {label_json_file}')
-
-            if not Path(filename).exists():
-                os.remove(label_json_file)
+                    self.loadLabels(self.labelFile.shapes)
+            except Exception as e:
+                print(e)
 
     def openNextImg(self, _value=False, load=True):
         keep_prev = self._config["keep_prev"]
@@ -1949,40 +2106,53 @@ class AnnolidWindow(MainWindow):
         """Pop-up and give focus to the label editor.
         position MUST be in global coordinates.
         """
-        items = self.uniqLabelList.selectedItems()
-        text = None
-        if items:
-            text = items[0].data(Qt.UserRole)
-        flags = {}
-        group_id = None
-        description = ""
-        if self._config["display_label_popup"] or not text:
-            previous_text = self.labelDialog.edit.text()
-            text, flags, group_id, description = self.labelDialog.popUp(text)
-            if not text:
-                self.labelDialog.edit.setText(previous_text)
-        if text and not self.validateLabel(text):
-            self.errorMessage(
-                self.tr("Invalid label"),
-                self.tr("Invalid label '{}' with validation type '{}'").format(
-                    text, self._config["validate_label"]
-                ),
-            )
-            text = ""
-        if text:
+        if self.canvas.createMode == 'grounding_sam':
             self.labelList.clearSelection()
-            shapes = self.canvas.setLastLabel(text, flags)
-            for shape in shapes:
-                shape.group_id = group_id
-                shape.description = description
-                self.addLabel(shape)
+            shapes = [
+                shape for shape in self.canvas.shapes
+                if shape.description == 'grounding_sam']
+            shape = shapes.pop()
+            self.addLabel(shape)
             self.actions.editMode.setEnabled(True)
             self.actions.undoLastPoint.setEnabled(False)
             self.actions.undo.setEnabled(True)
             self.setDirty()
         else:
-            self.canvas.undoLastLine()
-            self.canvas.shapesBackups.pop()
+            items = self.uniqLabelList.selectedItems()
+            text = None
+            if items:
+                text = items[0].data(Qt.UserRole)
+            flags = {}
+            group_id = None
+            description = ""
+            if self._config["display_label_popup"] or not text:
+                previous_text = self.labelDialog.edit.text()
+                text, flags, group_id, description = self.labelDialog.popUp(
+                    text)
+                if not text:
+                    self.labelDialog.edit.setText(previous_text)
+            if text and not self.validateLabel(text):
+                self.errorMessage(
+                    self.tr("Invalid label"),
+                    self.tr("Invalid label '{}' with validation type '{}'").format(
+                        text, self._config["validate_label"]
+                    ),
+                )
+                text = ""
+            if text:
+                self.labelList.clearSelection()
+                shapes = self.canvas.setLastLabel(text, flags)
+                for shape in shapes:
+                    shape.group_id = group_id
+                    shape.description = description
+                    self.addLabel(shape)
+                self.actions.editMode.setEnabled(True)
+                self.actions.undoLastPoint.setEnabled(False)
+                self.actions.undo.setEnabled(True)
+                self.setDirty()
+            else:
+                self.canvas.undoLastLine()
+                self.canvas.shapesBackups.pop()
 
     def glitter2(self):
         """

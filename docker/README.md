@@ -19,16 +19,7 @@ Please make sure that [Docker](https://www.docker.com/) is installed on your sys
 ```
 cd annolid/docker
 docker build -t annolid .
-```
-
-Then we need to get the `<Image ID>` of newly build container using: 
-```
-docker images
-``` 
-
-Copy the `<Image ID>` of the annolid repository and run 
-
-```
 xhost +local:docker
-docker run -it -v /tmp/.X11-unix:/tmp/.X11-unix/ -e DISPLAY=$DISPLAY  <Image ID>
+docker run -it -e XDG_RUNTIME_DIR=/tmp -e WAYLAND_DISPLAY=$WAYLAND_DISPLAY -v $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:/tmp/$WAYLAND_DISPLAY -e QT_QPA_PLATFORM=wayland annolid:latest
 ```
+

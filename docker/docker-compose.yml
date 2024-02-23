@@ -1,7 +1,7 @@
 version: "3"
 
 services:
-  app:
+  annolid:
     build:
       context: .
       dockerfile: ./Dockerfile
@@ -11,6 +11,7 @@ services:
       - XDG_RUNTIME_DIR=/tmp
       - WAYLAND_DISPLAY=$WAYLAND_DISPLAY
       - QT_QPA_PLATFORM=wayland
+      # - QT_QPA_PLATFORM=webgl:port=8998
     volumes:
       - $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:/tmp/$WAYLAND_DISPLAY
     network_mode: host
